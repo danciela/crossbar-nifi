@@ -56,7 +56,7 @@ import ws.wamp.jawampa.WampClientBuilder;
 import ws.wamp.jawampa.connection.IWampConnectorProvider;
 import ws.wamp.jawampa.transport.netty.NettyWampClientConnectorProvider;
 
-@Tags({ "example" })
+@Tags({ "crossbar.io", "wamp" })
 @CapabilityDescription("Provide a description")
 @SeeAlso({})
 @ReadsAttributes({ @ReadsAttribute(attribute = "", description = "") })
@@ -72,7 +72,7 @@ public class CrossbarSubscriber extends AbstractProcessor {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
 
     public static final PropertyDescriptor SUB_TOPIC = new PropertyDescriptor.Builder().name("Topic")
-            .displayName("Topic").description("Name od topic for subscription").required(true)
+            .displayName("Topic").description("Topic name").required(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
 
     public static final Relationship SUCCESS = new Relationship.Builder().name("succes")
