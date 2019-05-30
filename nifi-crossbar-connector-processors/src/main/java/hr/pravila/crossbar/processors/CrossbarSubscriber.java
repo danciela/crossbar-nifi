@@ -16,6 +16,8 @@
  */
 package hr.pravila.crossbar.processors;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -23,8 +25,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.nifi.annotation.behavior.ReadsAttribute;
@@ -38,7 +38,6 @@ import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
@@ -46,13 +45,12 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.processor.io.OutputStreamCallback;
 import org.apache.nifi.processor.util.StandardValidators;
 
-import rx.Scheduler;
 import rx.Subscription;
 import rx.functions.Action0;
 import rx.functions.Action1;
-import rx.schedulers.Schedulers;
 import ws.wamp.jawampa.WampClient;
 import ws.wamp.jawampa.WampClientBuilder;
 import ws.wamp.jawampa.connection.IWampConnectorProvider;
@@ -87,17 +85,7 @@ public class CrossbarSubscriber extends AbstractProcessor {
     private Set<Relationship> relationships;
 
     WampClient client;
-
-    // Subscription addProcSubscription;
-    // Subscription counterPublication;
-    Subscription onHelloSubscription;
-
-    // Scheduler for this example
-    ExecutorService executor = Executors.newSingleThreadExecutor();
-    Scheduler rxScheduler = Schedulers.from(executor);
-
-    static final int TIMER_INTERVAL = 1000; // 1s
-    int counter = 0;
+    Subscription onTopicSubscription;
 
     @Override
     protected void init(final ProcessorInitializationContext context) {
@@ -149,96 +137,106 @@ public class CrossbarSubscriber extends AbstractProcessor {
         }
 
         // Subscribe on the clients status updates
-        client.statusChanged().observeOn(rxScheduler).subscribe(new Action1<WampClient.State>() {
-            @Override
-            public void call(WampClient.State t1) {
-                System.out.println("Session status changed to " + t1);
+        client.statusChanged()
+                .subscribe(new Action1<WampClient.State>() {
+                    @Override
+                    public void call(WampClient.State t1) {
+                        System.out.println("Session status changed to " + t1);
 
-                if (t1 instanceof WampClient.ConnectedState) {
+                        if (t1 instanceof WampClient.ConnectedState) {
 
-                    // SUBSCRIBE to a topic and receive events
-                    onHelloSubscription = client
-                            .makeSubscription(context.getProperty(SUB_TOPIC).getValue(), String.class)
-                            .observeOn(rxScheduler).subscribe(new Action1<String>() {
-                                @Override
-                                public void call(String msg) {
-                                    logger.info ("Call method non subscription. Topic:" + context.getProperty(SUB_TOPIC).getValue());
-                                    Map<PropertyDescriptor, String> processorProperties = context.getProperties();
-                                    Map<String, String> generatedAttributes = new HashMap<String, String>();
-                                    for (final Map.Entry<PropertyDescriptor, String> entry : processorProperties
-                                            .entrySet()) {
-                                        PropertyDescriptor property = entry.getKey();
-                                        if (property.isDynamic() && property.isExpressionLanguageSupported()) {
-                                            String dynamicValue = context.getProperty(property)
-                                                    .evaluateAttributeExpressions().getValue();
-                                            generatedAttributes.put(property.getName(), dynamicValue);
+                            // SUBSCRIBE to a topic and receive events
+                            onTopicSubscription = client
+                                    .makeSubscription(context.getProperty(SUB_TOPIC).getValue(), String.class)
+                                    .subscribe(new Action1<String>() {
+                                        @Override
+                                        public void call(String msg) {
+                                            logger.info("Call method on subscription. Topic:"
+                                                    + context.getProperty(SUB_TOPIC).getValue());
+                                            Map<PropertyDescriptor, String> processorProperties = context
+                                                    .getProperties();
+
+                                            Map<String, String> generatedAttributes = new HashMap<String, String>();
+                                            for (final Map.Entry<PropertyDescriptor, String> entry : processorProperties
+                                                    .entrySet()) {
+                                                PropertyDescriptor property = entry.getKey();
+                                                if (property.isDynamic() && property.isExpressionLanguageSupported()) {
+                                                    String dynamicValue = context.getProperty(property)
+                                                            .evaluateAttributeExpressions().getValue();
+                                                    generatedAttributes.put(property.getName(), dynamicValue);
+                                                }
+                                            }
+
+                                            FlowFile flowFile = session.create();
+                                            logger.info("Flow file created." + flowFile.getId());
+                                            flowFile = session.putAllAttributes(flowFile, generatedAttributes);
+
+                                            flowFile = session.write(flowFile, new OutputStreamCallback() {
+                                                @Override
+                                                public void process(final OutputStream out) throws IOException {
+                                                    out.write(msg.getBytes());
+                                                }
+                                            });
+                                           
+                                            session.getProvenanceReporter().create(flowFile); // Transfer the output
+                                                                                              // flowfile to success
+                                                                                              // relationship.
+                                            session.transfer(flowFile, SUCCESS);
+                                            session.commit();
+
+                                            logger.debug("event for received: " + msg);
                                         }
-                                    }
+                                    }, new Action1<Throwable>() {
+                                        @Override
+                                        public void call(Throwable e) {
+                                            logger.info("Failed to subscribe: " + e);
+                                        }
+                                    }, new Action0() {
+                                        @Override
+                                        public void call() {
+                                            logger.info("Subscription ended");
+                                        }
+                                    });
 
-                                    FlowFile flowFile = session.create();
-
-                                    flowFile = session.putAllAttributes(flowFile, generatedAttributes);
-                                    flowFile = session.putAttribute(flowFile, "Message", msg);
-
-                                    session.getProvenanceReporter().create(flowFile);
-                                    session.transfer(flowFile, SUCCESS);
-
-                                    logger.info("event for received: " + msg);
-                                }
-                            }, new Action1<Throwable>() {
-                                @Override
-                                public void call(Throwable e) {
-                                    logger.info("Failed to subscribe: " + e);
-                                }
-                            }, new Action0() {
-                                @Override
-                                public void call() {
-                                    logger.info("Subscription ended");
-                                }
-                            });
-
-                } else if (t1 instanceof WampClient.DisconnectedState) {
-                    closeSubscriptions();
-                }
-            }
-        }, new Action1<Throwable>() {
-            @Override
-            public void call(Throwable t) {
-                System.out.println("Session ended with error " + t);
-            }
-        }, new Action0() {
-            @Override
-            public void call() {
-                System.out.println("Session ended normally");
-            }
-        });
+                        } else if (t1 instanceof WampClient.DisconnectedState) {
+                            closeSubscriptions();
+                        }
+                    }
+                }, new Action1<Throwable>() {
+                    @Override
+                    public void call(Throwable t) {
+                        System.out.println("Session ended with error " + t);
+                    }
+                }, new Action0() {
+                    @Override
+                    public void call() {
+                        System.out.println("Session ended normally");
+                    }
+                });
 
         client.open();
-        // waitUntilKeypressed();
-        //logger.info("Crossbar connector: Shutting down");
     }
 
     @OnStopped
     public void onStopped(ProcessContext context) {
+        ComponentLog logger = getLogger();
         if (client != null) {
             closeSubscriptions();
             client.close();
             try {
                 client.getTerminationFuture().get();
             } catch (Exception e) {
-                // logger.error("Error: " + e.getStackTrace().toString());
+                logger.error("Error: " + e.getStackTrace().toString());
             }
-            executor.shutdown();
         }
     }
 
     /**
-     * Close all subscriptions (registered events + procedures) and shut down all
-     * timers (doing event publication and calls)
+     * Close all subscriptions (registered events + procedures)
      */
     void closeSubscriptions() {
-        if (onHelloSubscription != null)
-            onHelloSubscription.unsubscribe();
-        onHelloSubscription = null;
+        if (onTopicSubscription != null)
+            onTopicSubscription.unsubscribe();
+        onTopicSubscription = null;
     }
 }
