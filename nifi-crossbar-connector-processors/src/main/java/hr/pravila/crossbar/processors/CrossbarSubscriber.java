@@ -16,6 +16,7 @@
  */
 package hr.pravila.crossbar.processors;
 
+import java.awt.Desktop;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -37,6 +38,7 @@ import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.Validator;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.AbstractProcessor;
@@ -51,13 +53,14 @@ import org.apache.nifi.processor.util.StandardValidators;
 import rx.Subscription;
 import rx.functions.Action0;
 import rx.functions.Action1;
+import ws.wamp.jawampa.SubscriptionFlags;
 import ws.wamp.jawampa.WampClient;
 import ws.wamp.jawampa.WampClientBuilder;
 import ws.wamp.jawampa.connection.IWampConnectorProvider;
 import ws.wamp.jawampa.transport.netty.NettyWampClientConnectorProvider;
 
 @Tags({ "crossbar.io", "wamp" })
-@CapabilityDescription("Provide a description")
+@CapabilityDescription("Crossbar.io subscriber connector")
 @SeeAlso({})
 @ReadsAttributes({ @ReadsAttribute(attribute = "", description = "") })
 @WritesAttributes({ @WritesAttribute(attribute = "", description = "") })
@@ -74,6 +77,11 @@ public class CrossbarSubscriber extends AbstractProcessor {
     public static final PropertyDescriptor SUB_TOPIC = new PropertyDescriptor.Builder().name("Topic")
             .displayName("Topic").description("Topic name").required(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
+
+    public static final PropertyDescriptor SUBSCRIPTION_FLAG = new PropertyDescriptor.Builder()
+            .name("SubscriptionFlags").displayName("Subscription Flags")
+            .description("Allowed one of the values: Exact, Prefix, Wildcard").required(true)
+            .addValidator(Validator.VALID).defaultValue("Exact").build();
 
     public static final Relationship SUCCESS = new Relationship.Builder().name("succes")
             .description("Success relationship").build();
@@ -93,6 +101,7 @@ public class CrossbarSubscriber extends AbstractProcessor {
         descriptors.add(CROSSBAR_URL);
         descriptors.add(CROSSBAR_REALM);
         descriptors.add(SUB_TOPIC);
+        descriptors.add(SUBSCRIPTION_FLAG);
         this.descriptors = Collections.unmodifiableList(descriptors);
 
         final Set<Relationship> relationships = new HashSet<Relationship>();
@@ -137,82 +146,83 @@ public class CrossbarSubscriber extends AbstractProcessor {
         }
 
         // Subscribe on the clients status updates
-        client.statusChanged()
-                .subscribe(new Action1<WampClient.State>() {
-                    @Override
-                    public void call(WampClient.State t1) {
-                        System.out.println("Session status changed to " + t1);
+        client.statusChanged().subscribe(new Action1<WampClient.State>() {
+            @Override
+            public void call(WampClient.State t1) {
+                System.out.println("Session status changed to " + t1);
 
-                        if (t1 instanceof WampClient.ConnectedState) {
+                if (t1 instanceof WampClient.ConnectedState) {
+                    // TBD test this
+                    SubscriptionFlags flag = SubscriptionFlags
+                            .valueOf(context.getProperty(SUBSCRIPTION_FLAG).getValue());
+                    logger.info("For flag: " + flag);
+                    // SUBSCRIBE to a topic and receive events
+                    onTopicSubscription = client
+                            .makeSubscription(context.getProperty(SUB_TOPIC).getValue(), flag, Map.class)
+                            .subscribe(new Action1<Map>() {
+                                @Override
+                                public void call(Map msg) {
+                                    logger.info("Call method on subscription. Topic:"
+                                            + context.getProperty(SUB_TOPIC).getValue());
+                                    Map<PropertyDescriptor, String> processorProperties = context.getProperties();
 
-                            // SUBSCRIBE to a topic and receive events
-                            onTopicSubscription = client
-                                    .makeSubscription(context.getProperty(SUB_TOPIC).getValue(), String.class)
-                                    .subscribe(new Action1<String>() {
-                                        @Override
-                                        public void call(String msg) {
-                                            logger.info("Call method on subscription. Topic:"
-                                                    + context.getProperty(SUB_TOPIC).getValue());
-                                            Map<PropertyDescriptor, String> processorProperties = context
-                                                    .getProperties();
-
-                                            Map<String, String> generatedAttributes = new HashMap<String, String>();
-                                            for (final Map.Entry<PropertyDescriptor, String> entry : processorProperties
-                                                    .entrySet()) {
-                                                PropertyDescriptor property = entry.getKey();
-                                                if (property.isDynamic() && property.isExpressionLanguageSupported()) {
-                                                    String dynamicValue = context.getProperty(property)
-                                                            .evaluateAttributeExpressions().getValue();
-                                                    generatedAttributes.put(property.getName(), dynamicValue);
-                                                }
-                                            }
-
-                                            FlowFile flowFile = session.create();
-                                            logger.info("Flow file created." + flowFile.getId());
-                                            flowFile = session.putAllAttributes(flowFile, generatedAttributes);
-
-                                            flowFile = session.write(flowFile, new OutputStreamCallback() {
-                                                @Override
-                                                public void process(final OutputStream out) throws IOException {
-                                                    out.write(msg.getBytes());
-                                                }
-                                            });
-                                           
-                                            session.getProvenanceReporter().create(flowFile); // Transfer the output
-                                                                                              // flowfile to success
-                                                                                              // relationship.
-                                            session.transfer(flowFile, SUCCESS);
-                                            session.commit();
-
-                                            logger.debug("event for received: " + msg);
+                                    Map<String, String> generatedAttributes = new HashMap<String, String>();
+                                    for (final Map.Entry<PropertyDescriptor, String> entry : processorProperties
+                                            .entrySet()) {
+                                        PropertyDescriptor property = entry.getKey();
+                                        if (property.isDynamic() && property.isExpressionLanguageSupported()) {
+                                            String dynamicValue = context.getProperty(property)
+                                                    .evaluateAttributeExpressions().getValue();
+                                            generatedAttributes.put(property.getName(), dynamicValue);
                                         }
-                                    }, new Action1<Throwable>() {
+                                    }
+
+                                    FlowFile flowFile = session.create();
+                                    logger.info("Flow file created." + flowFile.getId());
+                                    flowFile = session.putAllAttributes(flowFile, generatedAttributes);
+
+                                    flowFile = session.write(flowFile, new OutputStreamCallback() {
                                         @Override
-                                        public void call(Throwable e) {
-                                            logger.info("Failed to subscribe: " + e);
-                                        }
-                                    }, new Action0() {
-                                        @Override
-                                        public void call() {
-                                            logger.info("Subscription ended");
+                                        public void process(final OutputStream out) throws IOException {
+                                            out.write(msg.toString().getBytes());
                                         }
                                     });
 
-                        } else if (t1 instanceof WampClient.DisconnectedState) {
-                            closeSubscriptions();
-                        }
-                    }
-                }, new Action1<Throwable>() {
-                    @Override
-                    public void call(Throwable t) {
-                        System.out.println("Session ended with error " + t);
-                    }
-                }, new Action0() {
-                    @Override
-                    public void call() {
-                        System.out.println("Session ended normally");
-                    }
-                });
+                                    session.getProvenanceReporter().create(flowFile); // Transfer the output
+                                                                                      // flowfile to success
+                                                                                      // relationship.
+                                    session.transfer(flowFile, SUCCESS);
+                                    session.commit();
+
+                                    logger.debug("event for received: " + msg);
+                                }
+                            }, new Action1<Throwable>() {
+                                @Override
+                                public void call(Throwable e) {
+                                    logger.info("Failed to subscribe: " + e);
+                                }
+                            }, new Action0() {
+                                @Override
+                                public void call() {
+                                    logger.info("Subscription ended");
+                                }
+                            });
+
+                } else if (t1 instanceof WampClient.DisconnectedState) {
+                    closeSubscriptions();
+                }
+            }
+        }, new Action1<Throwable>() {
+            @Override
+            public void call(Throwable t) {
+                System.out.println("Session ended with error " + t);
+            }
+        }, new Action0() {
+            @Override
+            public void call() {
+                System.out.println("Session ended normally");
+            }
+        });
 
         client.open();
     }
